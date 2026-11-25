@@ -1,14 +1,20 @@
 #include <Arduino.h>
 #include <BLEDevice.h>
 #include <BLESecurity.h>
+#include <Preferences.h>
 #include <esp_log.h>
 #include <atomic>
 #include <vector>
 #include "ReceiverConfig.h"
 
 namespace {
-constexpr char kTarget[] = RECEIVER_TARGET_MAC;
-constexpr char kBuild[] = "0006";
+constexpr char kBuild[] = "0007";
+constexpr char kConfigNamespace[] = "remote-rx";
+constexpr char kTargetKey[] = "target";
+constexpr char kTargetCommand[] = "target";
+constexpr size_t kTargetCommandLength = sizeof(kTargetCommand) - 1;
+constexpr size_t kTargetLength = 17;
+String target;
 constexpr uint16_t kKeysHandle = 0x002b;
 constexpr size_t kMaxNotification = 244;
 constexpr size_t kMaxCommand = 32;
@@ -161,12 +167,12 @@ bool pairing = false;
 bool pairingRequested = false;
 bool stopRequested = false;
 
-const char* targetConfigurationError() {
-  if (kTarget[0] == '\0') return "target_not_configured";
-  if (strlen(kTarget) != 17) return "target_invalid";
-  for (size_t index = 0; index < 17; ++index) {
-    const char c = kTarget[index];
-    if (index % 3 == 2 ? c != ':' : !isxdigit(static_cast<unsigned char>(c))) {
+const char* targetConfigurationError(const char* address, size_t length) {
+  if (length == 0) return "target_not_configured";
+  if (length != kTargetLength) return "target_invalid";
+  for (size_t index = 0; index < length; ++index) {
+    const char c = address[index];
+    if (index % 3 == 2 ? c != ':' : hexDigit(c) < 0) {
       return "target_invalid";
     }
   }
@@ -175,20 +181,54 @@ const char* targetConfigurationError() {
 
 bool authenticated() { return authenticationResult.load() == 0; }
 
+void handleTargetCommand(const char* line, size_t length, bool overflow) {
+  if (!overflow && length == kTargetCommandLength) {
+    if (targetConfigurationError(target.c_str(), target.length())) {
+      Serial.println("TARGET configured=0");
+    } else {
+      Serial.printf("TARGET configured=1 address=%s\n", target.c_str());
+    }
+    return;
+  }
+  if (overflow || length != kTargetCommandLength + 1 + kTargetLength ||
+      line[kTargetCommandLength] != ' ' ||
+      targetConfigurationError(line + kTargetCommandLength + 1, kTargetLength)) {
+    Serial.println("TARGET_FAILED reason=target_invalid");
+    return;
+  }
+  char address[kTargetLength + 1]{};
+  memcpy(address, line + kTargetCommandLength + 1, kTargetLength);
+  Preferences config;
+  if (!config.begin(kConfigNamespace)) {
+    Serial.println("TARGET_FAILED reason=storage_unavailable");
+    return;
+  }
+  const size_t saved = config.putString(kTargetKey, address);
+  config.end();
+  if (saved != kTargetLength) {
+    Serial.println("TARGET_FAILED reason=write_failed");
+    return;
+  }
+  Serial.println("TARGET_SAVED rebooting=1");
+  delay(100);
+  ESP.restart();
+}
+
 void readCommands() {
   static char commandLine[3 + 2 * kMaxCommand];
   static size_t lineLength = 0;
-  static bool isTxLine = false;
   static bool overflow = false;
   for (unsigned count = 0; count < 96 && Serial.available(); ++count) {
     const int command = Serial.read();
-    if (isTxLine) {
+    if (lineLength) {
       if (command == '\r' || command == '\n') {
-        if (overflow) Serial.println("TX_FAILED reason=invalid_length");
+        if (lineLength >= kTargetCommandLength &&
+            memcmp(commandLine, kTargetCommand, kTargetCommandLength) == 0) {
+          handleTargetCommand(commandLine, lineLength, overflow);
+        } else if (overflow) Serial.println("TX_FAILED reason=invalid_length");
         else if (lineLength < 3 || commandLine[1] != 'x' || commandLine[2] != ' ') {
           Serial.println("TX_FAILED reason=invalid_command");
         } else sendVoiceCommand(commandLine + 3, lineLength - 3);
-        isTxLine = false;
         overflow = false;
         lineLength = 0;
       } else if (lineLength < sizeof(commandLine)) {
@@ -199,7 +239,6 @@ void readCommands() {
       continue;
     }
     if (command == 't') {
-      isTxLine = true;
       commandLine[lineLength++] = command;
     } else if (command == 'p') {
       if (pairing || pairingRequested) Serial.println("PAIRING_BUSY");
@@ -283,7 +322,7 @@ const char* removeTargetBond() {
 
 void beginPairing() {
   pairingRequested = false;
-  if (const char* error = targetConfigurationError()) {
+  if (const char* error = targetConfigurationError(target.c_str(), target.length())) {
     pairingFailed(error);
     return;
   }
@@ -294,7 +333,7 @@ void beginPairing() {
   pairing = true;
   scanningEnabled = false;
   ready = false;
-  Serial.printf("PAIRING_STARTED target=%s\n", kTarget);
+  Serial.printf("PAIRING_STARTED target=%s\n", target.c_str());
   if (!waitForDisconnect()) {
     pairingFailed("disconnect_timeout");
     return;
@@ -386,7 +425,7 @@ bool subscribe() {
 }
 
 void connectRemote() {
-  Serial.println("SCANNING target=" + String(kTarget));
+  Serial.println("SCANNING target=" + target);
   BLEScan* scan = BLEDevice::getScan();
   BLEScanResults results = scan->start(4, false);
   bool found = false;
@@ -437,7 +476,7 @@ void connectRemote() {
   if (ready) {
     Serial.printf("VOICE_AVAILABLE enabled=%u\n", voiceTxHandle != 0);
     Serial.printf("READY build=%s\n", kBuild);
-    if (pairing) Serial.printf("PAIRING_SUCCEEDED target=%s\n", kTarget);
+    if (pairing) Serial.printf("PAIRING_SUCCEEDED target=%s\n", target.c_str());
     pairing = false;
   } else {
     if (pairing) pairingFailed("subscription_failed");
@@ -453,9 +492,15 @@ void setup() {
   Serial.setDebugOutput(false);
   delay(1500);
   Serial.println("BOOT RemoteReceiver build=" + String(kBuild));
-  Serial.println("Commands: p=re-pair target, s=status, x=disconnect and stop, tx HEX=ATVV command");
-  if (const char* error = targetConfigurationError()) {
-    Serial.printf("CONFIG_REQUIRED reason=%s setting=RECEIVER_TARGET_MAC file=ReceiverConfig.local.h\n", error);
+  Serial.println("Commands: target [MAC]=show or save target, p=re-pair, s=status, x=disconnect and stop, tx HEX=ATVV command");
+  Preferences config;
+  if (config.begin(kConfigNamespace, true)) {
+    target = config.getString(kTargetKey);
+    config.end();
+  }
+  if (!target.length()) target = RECEIVER_TARGET_MAC;
+  if (const char* error = targetConfigurationError(target.c_str(), target.length())) {
+    Serial.printf("CONFIG_REQUIRED reason=%s command=target MAC\n", error);
     return;
   }
   events = xQueueCreate(64, sizeof(Event));
@@ -463,7 +508,7 @@ void setup() {
     Serial.println("INIT_FAILED reason=notification_queue_allocation");
     return;
   }
-  targetAddress = BLEAddress(std::string(kTarget));
+  targetAddress = BLEAddress(std::string(target.c_str()));
   BLEDevice::init(RECEIVER_DEVICE_NAME);
   BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT);
   BLEDevice::setSecurityCallbacks(&securityCallbacks);
